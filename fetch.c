@@ -162,42 +162,6 @@ static void claim_pinned_pidfile(void) {
     dprintf(fd, "%d\n", (int)getpid());
 }
 
-// Shell hooks for `eval "$(fetch --init <shell>)"`: clear and Ctrl-L stop
-// the pinned logo before clearing. The logo is drawn by a detached process
-// that can't see the shell's output, so the shell has to tell it.
-static int print_shell_init(const char *shell, const char *argv0) {
-  char self[PATH_MAX] = "fetch";
-  if (strchr(argv0, '/') && !realpath(argv0, self))
-    snprintf(self, sizeof(self), "%s", argv0);
-  const char *base = strrchr(shell, '/');
-  shell = base ? base + 1 : shell;
-  if (strcmp(shell, "bash") == 0) {
-    printf("__fetch_unpin() { '%s' --unpin 2>/dev/null; }\n"
-           "clear() { __fetch_unpin; command clear \"$@\"; }\n"
-           "if [[ $- == *i* ]]; then\n"
-           "  bind -x '\"\\e[fetch-unpin~\": __fetch_unpin'\n"
-           "  bind '\"\\e[fetch-clear~\": clear-screen'\n"
-           "  bind '\"\\C-l\": \"\\e[fetch-unpin~\\e[fetch-clear~\"'\n"
-           "fi\n",
-           self);
-  } else if (strcmp(shell, "zsh") == 0) {
-    printf("clear() { '%s' --unpin 2>/dev/null; command clear \"$@\"; }\n"
-           "_fetch_clear_screen() { '%s' --unpin 2>/dev/null; zle .clear-screen; }\n"
-           "zle -N clear-screen _fetch_clear_screen\n",
-           self, self);
-  } else if (strcmp(shell, "fish") == 0) {
-    printf("function clear; '%s' --unpin 2>/dev/null; command clear $argv; end\n"
-           "function __fetch_clear_screen; '%s' --unpin 2>/dev/null; "
-           "commandline -f clear-screen; end\n"
-           "bind \\cl __fetch_clear_screen\n",
-           self, self);
-  } else {
-    fprintf(stderr, "fetch: --init supports bash, zsh and fish\n");
-    return 1;
-  }
-  return 0;
-}
-
 #define ANIM_WIDTH 60
 #define MAX_HEIGHT 200
 #define GAP 2
@@ -4186,171 +4150,28 @@ static void get_alignment_padding(int* vertical, int* horizontal) {
 int main(int argc, char **argv) {
   char distro[64] = "";
   const char *logo_name = NULL;
-  float speed = 1.0f;
+  float speed = 2.0f;
   int show_info = 1;
   int use_color = 1;
-  int max_frames = 2000;
+  int max_frames = 0; // 0 = until one full turn, unless --infinite
   const char *shading = NULL;
-  int box_flag = 0;
-  int pinned_flag = 0; // 1 = --pinned, -1 = --no-pinned
   int frames_set = 0;
 
   for (int i = 1; i < argc; i++) {
-    if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-      printf(
-          "Usage: fetch [options]\n\n"
-          "Options:\n"
-          "  -l, --logo <name>         Use a logo from fastfetch by name\n"
-          "                            Any logo fastfetch supports works, "
-          "e.g.:\n"
-          "                              gentoo, arch, nixos, debian, ubuntu,\n"
-          "                              fedora, void, alpine, opensuse, "
-          "manjaro,\n"
-          "                              proxmox, pop, linuxmint, "
-          "endeavouros...\n"
-          "                            Run 'fastfetch --list-logos' to see "
-          "all\n"
-          "  -s, --speed <float>       Speed multiplier (default 1.0)\n"
-          "  --size <float>            Scale the logo (e.g. 2.0 for double "
-          "size)\n"
-          "  --depth <float>           Scale the 3D depth (default 1.0)\n"
-          "  --height <n>              Override render height in rows\n"
-          "  --no-info                 Just the logo, no system info\n"
-          "  --no-color                Disable logo coloring\n"
-          "  --frames <n>              Stop after n frames (default 2000)\n"
-          "  --infinite                Run forever (keypress or Ctrl-C to "
-          "exit)\n"
-          "  --shading-chars <str>     Draw with blocks and this shading ramp\n"
-          "                            instead of braille, supports UTF-8 "
-          "(e.g. ░▒▓█)\n"
-          "  --box                     Draw a border box around the info block\n"
-          "  --pinned                  Keep spinning at the top of the terminal\n"
-          "                            and give the shell the rows below "
-          "(default)\n"
-          "  --no-pinned               Take over the screen until a keypress\n"
-          "  --unpin                   Stop the pinned logo on this terminal\n"
-          "  --init <shell>            Print hooks that make clear and Ctrl-L\n"
-          "                            stop the pinned logo (bash, zsh, fish)\n"
-          "  -V, --version            Show version\n"
-          "  -h, --help                Show this help\n\n"
-          "Config: ~/.config/fetch/config\n"
-          "  List field names to show (in order), one per line.\n"
-          "  Comment out or remove fields to hide them.\n"
-          "  Available fields:\n"
-          "    os, host, kernel, uptime, packages, shell, display, wm,\n"
-          "    displaymanager, theme, icons, font, cursor, terminal, cpu,\n"
-          "    gpu, memory, swap, disk, ip, battery, powerprofile, locale,\n"
-          "    colors\n\n"
-          "  Separators and custom fields:\n"
-          "    ---                      Blank line separator\n"
-          "    custom_Label=value       Static field (e.g. custom_Pronouns=he/him)\n\n"
-          "  Extra disks:\n"
-          "    disk=/home               Show additional mount point\n"
-          "    disk=/data               (repeat for multiple mounts)\n\n"
-          "  Settings:\n"
-          "    label_color=<color>      Label color (red, green, yellow, "
-          "blue,\n"
-          "                             magenta, cyan, white, or ANSI number)\n"
-          "    separator=<char>         Title separator character\n"
-          "    shading=<str>            Block shading ramp (default: braille)\n"
-          "    light=<dir>              Light direction (top-left, top-right, "
-          "top,\n"
-          "                             left, right, front, bottom-left, "
-          "bottom-right)\n"
-          "    speed=<float>            Rotation speed\n"
-          "    size=<float>             Logo scale\n"
-          "    height=<n>               Render height in rows\n\n"
-          "    box=<0/1>                Draw a border box around the info block\n"
-          "    pinned=<0/1>             Run in --pinned mode (default 1)\n\n"
-          "Logo: ~/.config/fetch/logo.txt\n"
-          "  Custom ASCII/Unicode logo. Add '# distro: <name>' as the\n"
-          "  first line to set the color scheme.\n");
-      return 0;
-    } else if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-V") == 0) {
-      printf("fetch %s \"%s\" (%s, %s)\n", FETCH_VERSION, FETCH_CODENAME,
-             FETCH_ARCH, FETCH_OS);
-      return 0;
-    } else if (strcmp(argv[i], "--logo") == 0 || strcmp(argv[i], "-l") == 0) {
+    if (strcmp(argv[i], "--logo") == 0 || strcmp(argv[i], "-l") == 0) {
       if (i + 1 >= argc) {
         fprintf(stderr, "fetch: option '%s' requires an argument\n", argv[i]);
         return 1;
       }
       logo_name = argv[++i];
-    } else if (strcmp(argv[i], "--speed") == 0 || strcmp(argv[i], "-s") == 0) {
-      if (i + 1 >= argc) {
-        fprintf(stderr, "fetch: option '%s' requires an argument\n", argv[i]);
-        return 1;
-      }
-      speed = atof(argv[++i]);
-    } else if (strcmp(argv[i], "--no-info") == 0) {
-      show_info = 0;
-    } else if (strcmp(argv[i], "--no-color") == 0) {
-      use_color = 0;
-    } else if (strcmp(argv[i], "--frames") == 0) {
-      if (i + 1 >= argc) {
-        fprintf(stderr, "fetch: option '%s' requires an argument\n", argv[i]);
-        return 1;
-      }
-      max_frames = atoi(argv[++i]);
-      frames_set = 1;
     } else if (strcmp(argv[i], "--infinite") == 0) {
       max_frames = 0;
       frames_set = 1;
-    } else if (strcmp(argv[i], "--shading-chars") == 0) {
-      if (i + 1 >= argc) {
-        fprintf(stderr, "fetch: option '%s' requires an argument\n", argv[i]);
-        return 1;
-      }
-      shading = argv[++i];
-    } else if (strcmp(argv[i], "--height") == 0) {
-      if (i + 1 >= argc) {
-        fprintf(stderr, "fetch: option '%s' requires an argument\n", argv[i]);
-        return 1;
-      }
-      config_height = atoi(argv[++i]);
-      if (config_height > MAX_HEIGHT)
-        config_height = MAX_HEIGHT;
-    } else if (strcmp(argv[i], "--size") == 0) {
-      if (i + 1 >= argc) {
-        fprintf(stderr, "fetch: option '%s' requires an argument\n", argv[i]);
-        return 1;
-      }
-      size_scale = atof(argv[++i]);
-      if (size_scale < 0.5f)
-        size_scale = 0.5f;
-      if (size_scale > 5.0f)
-        size_scale = 5.0f;
-    } else if (strcmp(argv[i], "--depth") == 0) {
-      if (i + 1 >= argc) {
-        fprintf(stderr, "fetch: option '%s' requires an argument\n", argv[i]);
-        return 1;
-      }
-      config_depth = atof(argv[++i]);
-      if (config_depth < 0.1f)
-        config_depth = 0.1f;
-      if (config_depth > 10.0f)
-        config_depth = 10.0f;
-      depth_user_set = 1;
-    } else if (strcmp(argv[i], "--box") == 0) {
-      box_flag = 1;
-    } else if (strcmp(argv[i], "--pinned") == 0) {
-      pinned_flag = 1;
-    } else if (strcmp(argv[i], "--no-pinned") == 0) {
-      pinned_flag = -1;
-    } else if (strcmp(argv[i], "--init") == 0) {
-      if (i + 1 >= argc) {
-        fprintf(stderr, "fetch: option '%s' requires an argument\n", argv[i]);
-        return 1;
-      }
-      return print_shell_init(argv[i + 1], argv[0]);
-    } else if (strcmp(argv[i], "--unpin") == 0) {
-      if (!stop_pinned()) {
-        fprintf(stderr, "fetch: nothing pinned on this terminal\n");
-        return 1;
-      }
-      return 0;
     } else {
-      fprintf(stderr, "unknown option: %s\nTry 'fetch --help'\n", argv[i]);
+      fprintf(stderr,
+              "unknown option: %s\nUsage: fetch [-l|--logo <name>] "
+              "[--infinite]\n",
+              argv[i]);
       return 1;
     }
   }
@@ -4368,33 +4189,15 @@ int main(int argc, char **argv) {
     use_braille = 0;
     sub_rows = 2;
   }
-  if (config_speed > 0 && speed == 1.0f)
+  if (config_speed > 0)
     speed = config_speed;
-  if (box_flag)
-    config_box = 1;
-  if (pinned_flag)
-    config_pinned = pinned_flag > 0;
-  // Pinned is the default, so only complain when it was asked for
-  // explicitly; otherwise fall back to the classic full-screen run
-  if (config_pinned && !isatty(STDOUT_FILENO)) {
-    if (pinned_flag > 0) {
-      fprintf(stderr, "fetch: --pinned needs a terminal\n");
-      return 1;
-    }
+  // Pinned needs a tall enough terminal; otherwise fall back to the
+  // classic full-screen run
+  if (config_pinned &&
+      (!isatty(STDOUT_FILENO) || term_rows < PINNED_SHELL_ROWS + 10))
     config_pinned = 0;
-  }
-  if (config_pinned && term_rows < PINNED_SHELL_ROWS + 10) {
-    if (pinned_flag > 0) {
-      fprintf(stderr, "fetch: terminal too short for --pinned (%d rows)\n",
-              term_rows);
-      return 1;
-    }
-    config_pinned = 0;
-  }
   if (config_pinned) {
     config_v_alignment = V_ALIGN_TOP; // the logo owns the top rows
-    if (!frames_set)
-      max_frames = 0;
   }
 
   if (logo_name) {
@@ -4542,8 +4345,17 @@ int main(int argc, char **argv) {
   // Tighten render_height to fit the face-on logo + info,
   // but not when the user explicitly set --height
   if (config_height == 0) {
-    int logo_bottom = (int)(fixed_y_center + face_dn) + 2;
-    int info_bottom = show_info ? fetch_start + fetch_line_count + 1 : 0;
+    int logo_bottom = (int)(fixed_y_center + face_dn) + 1;
+    // Last non-blank info row that fits, so a clipped info column doesn't
+    // leave a trailing blank line (e.g. the one before colors) above the
+    // prompt
+    int info_bottom = 0;
+    if (show_info && layout_stacked)
+      info_bottom = fetch_start + fetch_line_count;
+    else if (show_info)
+      for (int i = 0; i < fetch_line_count && fetch_start + i < render_height; i++)
+        if (visible_width(fetch_lines[i]) > 0)
+          info_bottom = fetch_start + i + 1;
     int needed = logo_bottom > info_bottom ? logo_bottom : info_bottom;
     if (needed < render_height)
       render_height = needed;
@@ -4607,6 +4419,8 @@ int main(int argc, char **argv) {
   int mouse_dragging = 0;
   int mouse_last_x = 0;
   float drag_vy = 0.0f;
+  int one_turn = !frames_set; // default: stop after a single full turn
+  int last_frame = 0;
 
   for (int frame = 0; max_frames == 0 || frame < max_frames; frame++) {
     // Read input: mouse events control rotation, any other key exits.
@@ -4771,6 +4585,11 @@ int main(int argc, char **argv) {
         B += drag_vy;
       else
         B += 0.06f * speed;
+    }
+    // End on the starting pose, exactly one turn later
+    if (one_turn && fabsf(B) >= 2 * PI) {
+      B = copysignf(2 * PI, B);
+      last_frame = 1;
     }
     float cB = cosf(B), sB = sinf(B);
 
@@ -4969,6 +4788,8 @@ int main(int argc, char **argv) {
                     pinned_dcs_sync ? "\033P=2s\033\\" : "");
     }
     if (write(STDOUT_FILENO, out_buf, p - out_buf) < 0)
+      break;
+    if (last_frame)
       break;
     usleep(50000);
   }
