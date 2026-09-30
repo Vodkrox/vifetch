@@ -1,0 +1,36 @@
+name: Build y Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [linux-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compilar
+        shell: bash
+        run: |
+          for name in fetch vifetch; do
+            if [ -f "$name.c" ]; then
+              gcc -O2 -Wall -o "$name-${{ runner.os }}" "$name.c"
+            fi
+          done
+          ls -l
+
+      - name: Publicar en Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            fetch-*
+            vifetch-*
+          generate_release_notes: true
