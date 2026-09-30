@@ -1,7 +1,3 @@
-// Built-in distro logos so vifetch never needs an external tool to draw
-// them. ASCII art adapted from neofetch (MIT License,
-// https://github.com/dylanaraps/neofetch); colors remapped to the basic
-// 16-color ANSI palette that process_logo_row() understands.
 #ifndef VIFETCH_LOGOS_H
 #define VIFETCH_LOGOS_H
 
