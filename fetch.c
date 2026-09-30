@@ -24,6 +24,8 @@
 #include <limits.h>
 #include <ctype.h>
 
+#include "logos.h"
+
 #ifdef __APPLE__
 #include <sys/sysctl.h>
 #include <sys/mount.h>
@@ -341,7 +343,7 @@ static void parse_shading(const char *str) {
   }
   if (shading_count == 0) {
     // Fallback
-    strcpy(shading_chars[0], ".");
+    snprintf(shading_chars[0], sizeof(shading_chars[0]), "%s", ".");
     shading_count = 1;
   }
 }
@@ -619,130 +621,36 @@ static int load_logo_file(void) {
   return logo_rows > 0;
 }
 
-// Check if an ANSI escape is a cursor movement (not a color/SGR escape)
-static int is_cursor_escape(const char *p) {
-  if (p[0] != '\033' || p[1] != '[')
-    return 0;
-  int i = 2;
-  while (p[i] && ((p[i] >= '0' && p[i] <= '9') || p[i] == ';'))
-    i++;
-  return (p[i] && p[i] != 'm');
-}
-
-// Try loading a logo from fastfetch colored output
-static int load_logo_ff_colored(const char *name) {
-  char cmd[256];
-  snprintf(cmd, sizeof(cmd),
-           "fastfetch -c none -l %s -s break --pipe false 2>/dev/null", name);
-  FILE *fp = popen(cmd, "r");
-  if (!fp)
-    return 0;
-
-  char buf[512];
-  while (logo_rows < MAX_LOGO_ROWS && fgets(buf, sizeof(buf), fp)) {
-    int len = strlen(buf);
-    while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
-      buf[--len] = '\0';
-
-    // Find last SGR escape end before any cursor movement (marks end of logo content)
-    int truncated = 0;
-    int last_sgr_end = -1;
-    for (int i = 0; i < len - 2; i++) {
-      if (is_cursor_escape(&buf[i])) {
-        int cut = i;
-        // If we found a previous complete SGR, cut after it (keep the color reset)
-        if (last_sgr_end >= 0)
-          cut = last_sgr_end;
-        buf[cut] = '\0';
-        len = cut;
-        truncated = 1;
-        break;
-      }
-      // Track end positions of SGR sequences
-      if (buf[i] == '\033' && buf[i + 1] == '[') {
-        int j = i + 2;
-        while (buf[j] && ((buf[j] >= '0' && buf[j] <= '9') || buf[j] == ';'))
-          j++;
-        if (buf[j] == 'm') {
-          last_sgr_end = j + 1;
-          i = j;
-        }
-      }
-    }
-
-    if (len == 0 && logo_rows == 0)
-      continue;
-    if (len == 0 && truncated)
-      break;
-
-    memcpy(logo_data[logo_rows], buf, len + 1);
-    logo_rows++;
+// Check if any whitespace-separated token in `list` matches `name`
+// (case-insensitive).
+static int alias_list_has(const char *list, const char *name) {
+  char copy[256];
+  strncpy(copy, list, sizeof(copy) - 1);
+  copy[sizeof(copy) - 1] = '\0';
+  char *tok = strtok(copy, " ");
+  while (tok) {
+    if (strcasecmp(tok, name) == 0)
+      return 1;
+    tok = strtok(NULL, " ");
   }
-  pclose(fp);
-
-  while (logo_rows > 0 && logo_data[logo_rows - 1][0] == '\0')
-    logo_rows--;
-  return logo_rows > 0;
+  return 0;
 }
 
-// Fallback: load from --print-logos (no colors, but works on older fastfetch)
-static int load_logo_ff_plain(const char *name) {
-  FILE *fp = popen("fastfetch -c none --print-logos 2>/dev/null", "r");
-  if (!fp)
+// Load a logo from the built-in table (see logos.h). Matches against each
+// entry's id and its space-separated aliases, case-insensitively.
+static int load_logo_builtin(const char *name) {
+  if (!name || !name[0])
     return 0;
-
-  char buf[512];
-  int found = 0;
-  int name_len = strlen(name);
-
-  while (fgets(buf, sizeof(buf), fp)) {
-    int len = strlen(buf);
-    while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
-      buf[--len] = '\0';
-
-    if (!found) {
-      if (len > 0 && len <= name_len + 1 && buf[len - 1] == ':') {
-        buf[len - 1] = '\0';
-        if (strcasecmp(buf, name) == 0)
-          found = 1;
-      }
+  for (int i = 0; i < BUILTIN_LOGO_COUNT; i++) {
+    const builtin_logo_t *e = &builtin_logos[i];
+    if (strcasecmp(e->id, name) != 0 && !alias_list_has(e->aliases, name))
       continue;
-    }
-
-    // Detect next logo header
-    if (len > 1 && len < 40 && buf[len - 1] == ':' && logo_rows > 0 &&
-        ((buf[0] >= 'A' && buf[0] <= 'Z') ||
-         (buf[0] >= 'a' && buf[0] <= 'z'))) {
-      int is_header = 1;
-      for (int i = 0; i < len; i++) {
-        if (buf[i] == '\033') {
-          is_header = 0;
-          break;
-        }
-      }
-      if (is_header)
-        break;
-    }
-
-    if (logo_rows >= MAX_LOGO_ROWS)
-      break;
-
-    memcpy(logo_data[logo_rows], buf, len + 1);
-    logo_rows++;
-  }
-  pclose(fp);
-
-  while (logo_rows > 0 && logo_data[logo_rows - 1][0] == '\0')
-    logo_rows--;
-  return logo_rows > 0;
-}
-
-static int load_logo_fastfetch(const char *name) {
-  // Try colored output first (modern fastfetch)
-  if (load_logo_ff_colored(name))
+    logo_rows = e->line_count < MAX_LOGO_ROWS ? e->line_count : MAX_LOGO_ROWS;
+    for (int r = 0; r < logo_rows; r++)
+      snprintf(logo_data[r], sizeof(logo_data[r]), "%s", e->lines[r]);
     return 1;
-  // Fall back to --print-logos (older fastfetch, no colors)
-  return load_logo_ff_plain(name);
+  }
+  return 0;
 }
 
 // Parse a value from os-release, stripping quotes and newlines
@@ -769,61 +677,12 @@ static int parse_os_release_val(const char *buf, int prefix_len, char *out,
   return 0;
 }
 
-// Try to detect distro using fastfetch --json first (it's smarter than
-// os-release, e.g. it detects Proxmox even though ID=debian).
-// Falls back to /etc/os-release if fastfetch isn't available.
 static char distro_id_like[64] = "";
 
-static int detect_distro_fastfetch(char *out, int maxlen) {
-  FILE *fp = popen("fastfetch -c none --json 2>/dev/null", "r");
-  if (!fp)
-    return 0;
-  char buf[1024];
-  int found_os = 0;
-  while (fgets(buf, sizeof(buf), fp)) {
-    // Look for "id": "..." after "type": "OS"
-    if (strstr(buf, "\"OS\""))
-      found_os = 1;
-    if (found_os) {
-      char *id_pos = strstr(buf, "\"id\"");
-      if (id_pos) {
-        // Extract value: "id": "gentoo"
-        char *colon = strchr(id_pos, ':');
-        if (colon) {
-          char *q1 = strchr(colon, '"');
-          if (q1) {
-            q1++;
-            char *q2 = strchr(q1, '"');
-            if (q2 && q2 - q1 > 0 && q2 - q1 < maxlen) {
-              memcpy(out, q1, q2 - q1);
-              out[q2 - q1] = '\0';
-              pclose(fp);
-              return 1;
-            }
-          }
-        }
-      }
-      // Also grab idLike
-      char *like_pos = strstr(buf, "\"idLike\"");
-      if (like_pos) {
-        char *colon = strchr(like_pos, ':');
-        if (colon) {
-          char *q1 = strchr(colon, '"');
-          if (q1) {
-            q1++;
-            char *q2 = strchr(q1, '"');
-            if (q2 && q2 - q1 > 0 && q2 - q1 < (int)sizeof(distro_id_like)) {
-              memcpy(distro_id_like, q1, q2 - q1);
-              distro_id_like[q2 - q1] = '\0';
-            }
-          }
-        }
-      }
-    }
-  }
-  pclose(fp);
-  return 0;
-}
+// Proxmox VE reports ID=debian in os-release (it's a Debian derivative), but
+// /etc/pve is a distinctive marker: a pmxcfs FUSE mount that only exists on
+// a Proxmox VE host.
+static int detect_proxmox(void) { return access("/etc/pve", F_OK) == 0; }
 
 static int detect_distro_os_release(char *out, int maxlen) {
   FILE *fp = fopen("/etc/os-release", "r");
@@ -844,8 +703,6 @@ static int detect_distro_os_release(char *out, int maxlen) {
 
 static int detect_distro(char *out, int maxlen) {
 #ifdef __APPLE__
-  if (detect_distro_fastfetch(out, maxlen))
-    return 1;
   FILE *fp = popen("sw_vers -productName 2>/dev/null", "r");
   if (fp) {
     char buf[64];
@@ -859,38 +716,21 @@ static int detect_distro(char *out, int maxlen) {
   strncpy(out, "macos", maxlen-1);
   return 1;
 #else
-  if (detect_distro_fastfetch(out, maxlen))
+  if (detect_proxmox()) {
+    snprintf(out, maxlen, "%s", "proxmox");
     return 1;
+  }
   return detect_distro_os_release(out, maxlen);
 #endif
 }
 
+// Used when nothing matched a built-in logo and no logo.txt was found.
 static void load_default_logo(void) {
-  static const char *gentoo[] = {
-      "         -/oyddmdhs+:.            ",
-      "     -odNMMMMMMMMNNmhy+-`         ",
-      "   -yNMMMMMMMMMMMNNNmmdhy+-       ",
-      " `omMMMMMMMMMMMMNmdmmmmddhhy/`    ",
-      " omMMMMMMMMMMMNhhyyyohmdddhhhdo`  ",
-      ".ydMMMMMMMMMMdhs++so/smdddhhhhdm+`",
-      " oyhdmNMMMMMMMNdyooydMddddhhhhyhNd.",
-      "  :oyhhdNNMMMMMMMNNMMMdddhhhhhyymMh",
-      "    .:+sydNMMMMMNNMMMMdddhhhhhhmMmy",
-      "       /mMMMMMMNNNMMMdddhhhhhmMNhs:",
-      "    `oNMMMMMMMNNNMMMddddhhdmMNhs+` ",
-      "  `sNMMMMMMMMNNNMMMdddddmNMmhs/.   ",
-      " /NMMMMMMMMNNNNMMMdddmNMNdso:`     ",
-      "+MMMMMMMNNNNNMMMMdMNMNdso/-        ",
-      "yMMNNNNNNNMMMMMNNMmhs+/-`          ",
-      "/hMMNNNNNNNNMNdhs++/-`             ",
-      "`/ohdmmddhys+++/:.`                ",
-      "  `-//////:--.                     ",
-  };
-  logo_rows = 18;
-  for (int i = 0; i < logo_rows; i++) {
-    int len = strlen(gentoo[i]);
-    memcpy(logo_data[i], gentoo[i], len + 1);
-  }
+  logo_rows = sizeof(logo_generic_linux) / sizeof(logo_generic_linux[0]);
+  if (logo_rows > MAX_LOGO_ROWS)
+    logo_rows = MAX_LOGO_ROWS;
+  for (int i = 0; i < logo_rows; i++)
+    snprintf(logo_data[i], sizeof(logo_data[i]), "%s", logo_generic_linux[i]);
 }
 
 // Headroom for the 2x2 sub-cell grid, which needs more points to fill it at
@@ -1049,19 +889,19 @@ static void load_config(void) {
       strip_inline_hint(val);
       // Accept color names or numbers
       if (strcmp(val, "red") == 0)
-        strcpy(label_color, "31");
+        snprintf(label_color, sizeof(label_color), "%s", "31");
       else if (strcmp(val, "green") == 0)
-        strcpy(label_color, "32");
+        snprintf(label_color, sizeof(label_color), "%s", "32");
       else if (strcmp(val, "yellow") == 0)
-        strcpy(label_color, "33");
+        snprintf(label_color, sizeof(label_color), "%s", "33");
       else if (strcmp(val, "blue") == 0)
-        strcpy(label_color, "34");
+        snprintf(label_color, sizeof(label_color), "%s", "34");
       else if (strcmp(val, "magenta") == 0)
-        strcpy(label_color, "35");
+        snprintf(label_color, sizeof(label_color), "%s", "35");
       else if (strcmp(val, "cyan") == 0)
-        strcpy(label_color, "36");
+        snprintf(label_color, sizeof(label_color), "%s", "36");
       else if (strcmp(val, "white") == 0)
-        strcpy(label_color, "37");
+        snprintf(label_color, sizeof(label_color), "%s", "37");
       else
         strncpy(label_color, val, sizeof(label_color) - 1);
       continue;
@@ -1482,7 +1322,7 @@ static void gather_os(void) {
     fclose(fp);
   }
   if (!pretty[0])
-    strcpy(pretty, "Linux");
+    snprintf(pretty, sizeof(pretty), "%s", "Linux");
 
   struct utsname u;
   uname(&u);
@@ -2229,7 +2069,7 @@ static void gather_wm(void) {
   // 1. Check env vars for specific WMs
   char *hyprland = getenv("HYPRLAND_INSTANCE_SIGNATURE");
   if (hyprland) {
-    strcpy(wm, "Hyprland");
+    snprintf(wm, sizeof(wm), "%s", "Hyprland");
     wm_is_binary = 1;
   }
 
@@ -2695,17 +2535,17 @@ static void gather_gpu(void) {
       if (cpu[0])
         snprintf(name, sizeof(name), "Apple %s", cpu);
       else
-        strcpy(name, "Apple GPU");
+        snprintf(name, sizeof(name), "%s", "Apple GPU");
       type = "Integrated";
     } else if (pci_id[0] && gpu_lookup_lspci(pci_id, name, sizeof(name))) {
       // lspci gave us a human name.
     } else if (strcmp(driver, "i915") == 0 || strcmp(driver, "xe") == 0) {
-      strcpy(name, "Intel Graphics");
+      snprintf(name, sizeof(name), "%s", "Intel Graphics");
     } else if (strcmp(driver, "amdgpu") == 0 || strcmp(driver, "radeon") == 0) {
-      strcpy(name, "AMD Graphics");
+      snprintf(name, sizeof(name), "%s", "AMD Graphics");
     } else if (strcmp(driver, "nvidia") == 0 ||
                strcmp(driver, "nouveau") == 0) {
-      strcpy(name, "NVIDIA GPU");
+      snprintf(name, sizeof(name), "%s", "NVIDIA GPU");
     } else if (driver[0]) {
       strncpy(name, driver, sizeof(name) - 1);
     }
@@ -3136,13 +2976,13 @@ static void gather_terminal(void) {
   if (tp && tp[0]) {
     strncpy(term, tp, sizeof(term) - 1);
   } else if (getenv("KITTY_WINDOW_ID")) {
-    strcpy(term, "kitty");
+    snprintf(term, sizeof(term), "%s", "kitty");
   } else if (getenv("ALACRITTY_LOG")) {
-    strcpy(term, "alacritty");
+    snprintf(term, sizeof(term), "%s", "alacritty");
   } else if (getenv("WEZTERM_PANE")) {
-    strcpy(term, "wezterm");
+    snprintf(term, sizeof(term), "%s", "wezterm");
   } else if (getenv("GHOSTTY_RESOURCES_DIR")) {
-    strcpy(term, "ghostty");
+    snprintf(term, sizeof(term), "%s", "ghostty");
   } else if (getenv("TERMINAL_EMULATOR")) {
     strncpy(term, getenv("TERMINAL_EMULATOR"), sizeof(term) - 1);
   } else {
@@ -4201,13 +4041,12 @@ int main(int argc, char **argv) {
   }
 
   if (logo_name) {
-    if (!load_logo_fastfetch(logo_name)) {
+    if (!load_logo_builtin(logo_name)) {
       load_default_logo();
-      if (strcasecmp(logo_name, "gentoo") != 0)
-        fprintf(stderr,
-                "fetch: couldn't load %s logo (is fastfetch installed?). "
-                "using built-in gentoo logo.\n",
-                logo_name);
+      fprintf(stderr,
+              "fetch: no built-in logo for '%s'. Using the generic logo. "
+              "Drop a ~/.config/fetch/logo.txt for a custom one.\n",
+              logo_name);
     }
     strncpy(distro, logo_name, sizeof(distro) - 1);
   } else {
@@ -4218,17 +4057,16 @@ int main(int argc, char **argv) {
     else
       detect_distro(distro, sizeof(distro));
 
-    // Only try fastfetch if no custom logo.txt was loaded
     int got_logo = has_custom_logo;
     if (!got_logo && distro[0]) {
-      got_logo = load_logo_fastfetch(distro);
+      got_logo = load_logo_builtin(distro);
       if (!got_logo && distro_id_like[0]) {
         char like_copy[64];
         strncpy(like_copy, distro_id_like, sizeof(like_copy) - 1);
         like_copy[sizeof(like_copy) - 1] = '\0';
         char *tok = strtok(like_copy, " ");
         while (tok && !got_logo) {
-          got_logo = load_logo_fastfetch(tok);
+          got_logo = load_logo_builtin(tok);
           if (got_logo)
             strncpy(distro, tok, sizeof(distro) - 1);
           tok = strtok(NULL, " ");
@@ -4237,10 +4075,10 @@ int main(int argc, char **argv) {
     }
     if (!got_logo && logo_rows == 0) {
       load_default_logo();
-      if (distro[0] && strcasecmp(distro, "gentoo") != 0)
+      if (distro[0])
         fprintf(stderr,
-                "fetch: couldn't load %s logo (is fastfetch installed?). "
-                "using built-in gentoo logo.\n",
+                "fetch: no built-in logo for '%s'. Using the generic logo. "
+                "Drop a ~/.config/fetch/logo.txt for a custom one.\n",
                 distro);
     }
   }
